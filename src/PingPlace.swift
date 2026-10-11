@@ -26,15 +26,18 @@ enum NotificationPosition: String, CaseIterable {
 private enum AppConstants {
   static let notificationCenterBundleID = "com.apple.notificationcenterui"
   static let childrenChangedNotification = "AXChildrenChanged"
+  static let layoutChangedNotification = "AXLayoutChanged"
   static let orderedChildrenAttribute = "AXOrderedChildren"
   static let widgetEditorButtonIdentifier = "widget-editor-button"
   static let widgetIdentifierPrefix = "widget-local:"
   static let maxAccessibilityNodesPerWindow = 10_000
   static let dockPadding: CGFloat = 30
+  static let restoreDelay: TimeInterval = 0.7
   static let bannerRightPadding: CGFloat = 16
   static let bannerSubroles: Set<String> = [
     "AXNotificationCenterBanner", "AXNotificationCenterAlert",
     "AXNotificationCenterNotification", "AXNotificationCenterBannerWindow",
+    "AXNotificationCenterAlertStack",
   ]
   static let subsystem = "com.grimridge.PingPlace"
 }
@@ -126,6 +129,18 @@ private struct WindowPlacementState {
   let baselineBannerFrame: CGRect
 }
 
+private enum NotificationPlacementGeometry {
+  static func bottomWindowY(
+    windowFrame: CGRect, bannerFrame: CGRect, visibleFrame: CGRect,
+    globalTopY: CGFloat, padding: CGFloat
+  ) -> CGFloat {
+    // Accessibility coordinates grow down; NSScreen coordinates grow up.
+    let visibleBottom = globalTopY - visibleFrame.minY
+    let localBannerBottom = bannerFrame.maxY - windowFrame.minY
+    return visibleBottom - padding - localBannerBottom
+  }
+}
+
 extension AXError {
   fileprivate var name: String {
     switch self {
@@ -168,8 +183,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private var statusItem: NSStatusItem?
   private var observedWindows = Set<AXUIElement>()
   private var placementByWindow = [AXUIElement: WindowPlacementState]()
+  private var pendingRestores = [AXUIElement: DispatchWorkItem]()
 
   private let logger = Logger.app
+  private static let timestampFormatter = ISO8601DateFormatter()
   private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Logs/PingPlace.log")
   private var isIconHidden = UserDefaults.standard.bool(forKey: DefaultsKey.menuBarIconHidden)
@@ -237,6 +254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       kAXWindowCreatedNotification as String, for: appElement, label: "Notification Center app")
     register(
       AppConstants.childrenChangedNotification, for: appElement, label: "Notification Center app")
+    register(
+      AppConstants.layoutChangedNotification, for: appElement, label: "Notification Center app")
     refreshWindowObservers()
     info("AXObserver ready for Notification Center pid=\(app.processIdentifier)")
   }
@@ -269,6 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       guard observedWindows.insert(window).inserted else { continue }
       register(
         AppConstants.childrenChangedNotification, for: window, label: "Notification Center window")
+      register(
+        AppConstants.layoutChangedNotification, for: window, label: "Notification Center window")
       register(kAXCreatedNotification as String, for: window, label: "Notification Center window")
       register(
         kAXUIElementDestroyedNotification as String, for: window,
@@ -329,6 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let banner: AXUIElement
     switch classify(window) {
     case .panel:
+      cancelPendingRestore(window)
       restoreWindowIfNeeded(window, reason: "Notification Center panel opened")
       debug("Skipping Notification Center panel state")
       return
@@ -336,9 +358,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       debug("Skipping desktop widget window")
       return
     case .banner(let element):
+      cancelPendingRestore(window)
       banner = element
     case .other:
-      restoreWindowIfNeeded(window, reason: "No banner visible")
+      scheduleRestore(window, reason: "No banner visible")
       debug("Skipping window without banner")
       return
     case .indeterminate:
@@ -352,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       let bannerFrame = banner.frame(),
       let windowFrame = window.frame()
     else {
-      restoreWindowIfNeeded(window, reason: "No banner visible")
+      scheduleRestore(window, reason: "No banner visible")
       debug("Skipping window without banner")
       return
     }
@@ -380,7 +403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     guard
       let target = targetOrigin(
         for: placement.baselineWindowFrame,
-        bannerFrame: placement.baselineBannerFrame
+        // Preserve the unshifted origin, but account for resizing and expanded stacks.
+        bannerFrame: CGRect(origin: placement.baselineBannerFrame.origin, size: bannerFrame.size)
       )
     else {
       debug("Skipping window without containing screen for banner")
@@ -399,6 +423,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   private func moveAll() {
     notificationCenterWindows.forEach(move)
+  }
+
+  // Keep the window in place until the fade-out animation has finished.
+  private func scheduleRestore(_ window: AXUIElement, reason: String) {
+    guard placementByWindow[window] != nil, pendingRestores[window] == nil else { return }
+    let item = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingRestores.removeValue(forKey: window)
+      self.restoreWindowIfNeeded(window, reason: "\(reason) (deferred)")
+    }
+    pendingRestores[window] = item
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + AppConstants.restoreDelay, execute: item)
+  }
+
+  private func cancelPendingRestore(_ window: AXUIElement) {
+    pendingRestores.removeValue(forKey: window)?.cancel()
   }
 
   private func restoreWindowIfNeeded(_ window: AXUIElement, reason: String) {
@@ -449,7 +490,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     case .middleLeft, .deadCenter, .middleRight:
       y = (windowFrame.height - bannerFrame.height) / 2 - dockSize - AppConstants.dockPadding
     case .bottomLeft, .bottomMiddle, .bottomRight:
-      y = windowFrame.height - bannerFrame.height - dockSize - AppConstants.dockPadding
+      y = NotificationPlacementGeometry.bottomWindowY(
+        windowFrame: windowFrame, bannerFrame: bannerFrame, visibleFrame: visibleFrame,
+        globalTopY: NSScreen.screens.map(\.frame.maxY).max() ?? screenFrame.maxY,
+        padding: AppConstants.dockPadding
+      )
     }
 
     debug(
@@ -690,9 +735,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     log(.info, message)
   }
 
-  private func debug(_ message: String) {
+  private func debug(_ message: @autoclosure () -> String) {
     guard isDebugLoggingEnabled else { return }
-    log(.debug, message)
+    log(.debug, message())
   }
 
   private func error(_ message: String) {
@@ -717,7 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       logger.error("\(message, privacy: .public)")
     }
 
-    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let timestamp = Self.timestampFormatter.string(from: Date())
     let line = "[\(level.rawValue)] \(timestamp) \(message)\n"
     let data = Data(line.utf8)
     guard let fileHandle = try? FileHandle(forWritingTo: logFileURL) else { return }
